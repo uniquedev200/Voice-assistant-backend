@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+websockets
+groq
+deepgram-sdk
+elevenlabs
+python-dotenv
+aiohttp

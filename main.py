@@ -50,6 +50,7 @@ async def websocket_endpoint(websocket: WebSocket, device_id: str):
     sessions[device_id] = session
 
     audio_queue: asyncio.Queue = asyncio.Queue()
+    audio_chunk_count = 0
 
     def on_partial(text: str):
         logger.info(f"[Deepgram] Partial: {text}")
@@ -93,7 +94,9 @@ async def websocket_endpoint(websocket: WebSocket, device_id: str):
                 audio_bytes = data["bytes"]
                 if audio_bytes:
                     await audio_queue.put(audio_bytes)
-                    logger.debug(f"[WS] Audio chunk queued: {len(audio_bytes)} bytes")
+                    audio_chunk_count += 1
+                    if audio_chunk_count % 50 == 0:
+                        logger.info(f"[WS] Audio chunks received so far: {audio_chunk_count}, latest size: {len(audio_bytes)} bytes")
 
             elif "text" in data:
                 text_data = data["text"]
@@ -129,7 +132,7 @@ async def websocket_endpoint(websocket: WebSocket, device_id: str):
             deepgram_task.cancel()
         await session.cancel_all_tasks()
         sessions.pop(device_id, None)
-        logger.info(f"[WS] Session cleaned up: {device_id}")
+        logger.info(f"[WS] Session cleaned up: {device_id} — total audio chunks received: {audio_chunk_count}")
 
 
 async def process_turn(
@@ -166,7 +169,6 @@ async def process_turn(
                 sentence_buffer += token
                 full_response += token
 
-                # Send token to client for UI display
                 try:
                     await websocket.send_json({
                         "type": "ASSISTANT_TOKEN",
@@ -175,7 +177,6 @@ async def process_turn(
                 except Exception:
                     pass
 
-                # Flush to TTS on sentence boundary
                 for end_mark in [".", "?", "!"]:
                     if sentence_buffer.strip().endswith(end_mark):
                         chunk_text = sentence_buffer.strip()
@@ -188,7 +189,6 @@ async def process_turn(
                         sentence_buffer = ""
                         break
 
-        # Flush any remaining buffer
         if sentence_buffer.strip() and not session.cancel_event.is_set():
             logger.info(f"[TTS] Flushing: {sentence_buffer.strip()}")
             async for audio_chunk in stream_tts(sentence_buffer.strip(), session.cancel_event):
@@ -196,13 +196,11 @@ async def process_turn(
                     break
                 await websocket.send_bytes(audio_chunk)
 
-        # Signal response complete
         try:
             await websocket.send_json({"type": "ASSISTANT_DONE"})
         except Exception:
             pass
 
-        # Save full response to context
         if full_response:
             session.context.add_assistant_message(full_response)
             logger.info(f"[Turn] Complete. Response: {full_response[:100]}...")

@@ -2,7 +2,7 @@ fastapi
 uvicorn
 websockets
 groq
-deepgram-sdk
+deepgram-sdk==3.2.7
 elevenlabs
 python-dotenv
 aiohttp

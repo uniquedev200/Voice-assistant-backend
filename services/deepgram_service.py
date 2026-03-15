@@ -16,67 +16,84 @@ async def stream_audio(
 ) -> None:
     api_key = os.getenv("DEEPGRAM_API_KEY")
     if not api_key:
-        logger.error("Deepgram API key not configured")
+        logger.error("[Deepgram] API key not configured")
         return
 
-    from deepgram import AsyncDeepgramClient
-    from deepgram.listen import v1
+    logger.info("[Deepgram] Connecting...")
 
-    dg_client = AsyncDeepgramClient(api_key)
-
-    dg_connection = None
     try:
-        async with dg_client.listen.v1.connect(
+        from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
+
+        dg_client = DeepgramClient(api_key)
+        connection = dg_client.listen.live.v("1")
+
+        def on_message(self, result, **kwargs):
+            try:
+                transcript = result.channel.alternatives[0].transcript
+                if transcript:
+                    if result.is_final:
+                        logger.info(f"[Deepgram] Final: {transcript}")
+                        on_final(transcript)
+                    else:
+                        logger.info(f"[Deepgram] Partial: {transcript}")
+                        on_partial(transcript)
+            except Exception as e:
+                logger.error(f"[Deepgram] Message error: {e}")
+
+        def on_speech_started_event(self, speech_started, **kwargs):
+            logger.info("[Deepgram] Speech started")
+            if on_speech_started and is_speaking_getter and is_speaking_getter():
+                on_speech_started()
+
+        def on_utterance_end(self, utterance_end, **kwargs):
+            logger.info("[Deepgram] Utterance end")
+
+        def on_error(self, error, **kwargs):
+            logger.error(f"[Deepgram] Error: {error}")
+
+        def on_close(self, close, **kwargs):
+            logger.info("[Deepgram] Connection closed")
+
+        connection.on(LiveTranscriptionEvents.Transcript, on_message)
+        connection.on(LiveTranscriptionEvents.SpeechStarted, on_speech_started_event)
+        connection.on(LiveTranscriptionEvents.UtteranceEnd, on_utterance_end)
+        connection.on(LiveTranscriptionEvents.Error, on_error)
+        connection.on(LiveTranscriptionEvents.Close, on_close)
+
+        options = LiveOptions(
             model="nova-2",
             language="en",
-            smart_format="true",
-            interim_results="true",
-            vad_events="true",
-            punctuate="true"
-        ) as connection:
-            dg_connection = connection
+            smart_format=True,
+            interim_results=True,
+            vad_events=True,
+            punctuate=True,
+            utterance_end_ms=1000,
+            endpointing=500
+        )
 
-            async def send_audio():
-                while not cancel_event.is_set():
-                    try:
-                        audio_data = await asyncio.wait_for(audio_queue.get(), timeout=0.1)
-                        if audio_data:
-                            await connection.send(audio_data)
-                    except asyncio.TimeoutError:
-                        continue
-                    except Exception as e:
-                        logger.error(f"Error sending audio: {e}")
-                        break
+        started = connection.start(options)
+        if not started:
+            logger.error("[Deepgram] Failed to start connection")
+            return
 
-            async def receive_events():
-                async for result in connection:
-                    if cancel_event.is_set():
-                        break
+        logger.info("[Deepgram] Connected and listening")
 
-                    if isinstance(result, v1.ListenV1Results):
-                        if result.channel and result.channel.alternatives:
-                            transcript = result.channel.alternatives[0].transcript
-                            if transcript:
-                                if result.is_final:
-                                    logger.info(f"Deepgram final: {transcript}")
-                                    on_final(transcript)
-                                else:
-                                    on_partial(transcript)
+        # Send audio chunks from queue
+        while not cancel_event.is_set():
+            try:
+                audio_data = await asyncio.wait_for(
+                    audio_queue.get(), timeout=0.1
+                )
+                if audio_data:
+                    connection.send(audio_data)
+            except asyncio.TimeoutError:
+                continue
+            except Exception as e:
+                logger.error(f"[Deepgram] Send error: {e}")
+                break
 
-                    elif isinstance(result, v1.ListenV1SpeechStarted):
-                        logger.info("Deepgram: SpeechStarted event")
-                        if on_speech_started and is_speaking_getter and is_speaking_getter():
-                            on_speech_started()
-
-                    elif isinstance(result, v1.ListenV1UtteranceEnd):
-                        logger.info("Deepgram: SpeechEnded event")
-
-            send_task = asyncio.create_task(send_audio())
-            receive_task = asyncio.create_task(receive_events())
-
-            await asyncio.gather(send_task, receive_task, return_exceptions=True)
+        connection.finish()
+        logger.info("[Deepgram] Stream finished")
 
     except Exception as e:
-        logger.error(f"Deepgram connection error: {e}")
-    finally:
-        logger.info("Deepgram stream closed")
+        logger.error(f"[Deepgram] Connection error: {e}", exc_info=True)
